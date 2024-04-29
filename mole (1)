@@ -1,0 +1,435 @@
+#!/bin/bash
+POSIXLY_CORRECT=yes
+OPEN="vi"
+now=$(date '+%Y-%m-%d_%H-%M-%S')
+if [ "$EDITOR" = "" ] && [ "$VISUAL" != "" ]
+then
+    OPEN="$VISUAL"
+elif [ "$EDITOR" != "" ] && [ "$VISUAL" = "" ]
+then
+    OPEN="$EDITOR"
+fi
+
+
+helps()
+{   
+    echo "Tento script umoznuje zpracovavat zaznamy o otevrenych souborech"
+    echo "zaznamenava jmeno souboru, cestu, a datum otevreni"
+    echo "mole [-g GROUP] FILE"
+    echo "mole [-m] [FILTERS] [DIRECTORY]"
+    echo "mole list [FILTERS] [DIRECTORY]"
+    echo "mole secret-log [-b DATE] [-a DATE] [DIRECTORY1 [DIRECTORY2 [...]]]"
+    echo "Options:"
+    echo "-g GROUP      Assign the opened file to a group named GROUP"
+    echo "-b DATE       Display log of files edited after DATE (YYYY-MM-DD)"
+    echo "-a DATE       Display log of files edited before DATE (YYYY-MM-DD)"
+    echo "-m            Select the most recently modified file in the DIRECTORY"
+    echo "list          List all files opened using mole"
+    echo "secret-log    Display log of files edited by users in specified directories"
+    exit 0
+}
+filters(){
+    if [ "$GFlag" = true ]
+    then
+        line=""
+        IFS=','
+        tmp=""
+        while read -r line
+        do
+            for i in $grupa
+            do
+                if grep -qE "(^|[,])$i([,;]|$)" <<< "$line"
+                then
+                    LIST=$(grep -E "(^|[,])$i([,;]|$)" <<< "$line")
+                    tmp+="$LIST"$'\n'
+                fi
+            done
+        done <<< "$LIST_VALUE"
+        LIST_VALUE="$tmp"
+    fi
+    if [ "$AfterFlag" = true ]
+    then
+        DateA=$(echo "$DateA" | tr -d '-')
+        LIST_VALUE=$(echo "$LIST_VALUE" | awk -F';' -v date1=$DateA '
+        {
+        printf "%s;%s", $1, $2
+        for (i = 3; i<=NF; i++) {
+            d=$i; substr($3,1,index($NF,"_")-1);
+            if (d <= date1)
+                printf ";%s", $i
+        }
+        print "\n"
+        }')
+        LIST_VALUE=$(echo "$LIST_VALUE" | awk -F ';' 'NF >= 3')
+        
+    fi
+    if [ "$BeforeFlag" = true ]
+    then
+        DateB=$(echo "$DateB" | tr -d '-')
+        LIST_VALUE=$(echo "$LIST_VALUE" | awk -F';' -v date1=$DateB '
+        {
+        printf "%s;%s", $1, $2
+        for (i = 3; i<=NF; i++) {
+            d=$i; substr($3,1,index($NF,"_")-1);
+            if (d > date1)
+                printf ";%s", $i
+        }
+        print "\n"
+        }')
+        LIST_VALUE=$(echo "$LIST_VALUE" | awk -F ';' 'NF >= 3')
+    fi
+}
+DateRegEx(){
+    DateRegex='^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+    if [[ ! $Date =~ $DateRegex ]]
+    then
+        echo "Neplatný formát datumu, prosím ve formátu YYYY-MM-DD."
+        exit 1
+    fi
+    if date -d "$Date" >/dev/null 2>&1
+    then
+        echo "Platné datum"
+    else
+        echo "Neplatné datum"
+        exit 1
+    fi
+}
+Secret(){
+    if [[ "$MFlag" = true || "$ListFlag" = true || "$GFlag" = true ]]
+    then
+        exit 1
+    fi
+    LIST_VALUE=$(echo "$LIST_VALUE" | awk -F';' '{sub(/^[^;]*;/,"")}1')
+    ZIP="log_""$USER""_now"
+    echo "$LIST_VALUE" > "$path/$ZIP"
+    bzip2 -f "$path/$ZIP"
+    exit 0
+}
+LexSort(){
+    LIST_VALUE=$(echo "$LIST_VALUE" | awk -F '[;,]' '{
+    rows[NR] = $0
+    groups[NR] = $1
+    }
+    END {
+        for (group in groups) {
+            for (row in rows) {
+                if (groups[row] == groups[group]) {
+                    split(rows[row], cols, ";")
+                    split(cols[1], gcols, ",")
+                    n = asort(gcols)
+                    new_gcols = ""
+                    for (i = 1; i <= n; i++) {
+                        new_gcols = new_gcols gcols[i]
+                        if (i < n) {
+                            new_gcols = new_gcols ","
+                        }
+                    }
+                    cols[1] = new_gcols ","
+                    rows[row] = cols[1] ";" substr(rows[row], index(rows[row], ";")+1)
+                }
+            }
+        }
+        for (row in rows) {
+            print substr(rows[row], 2)
+        }
+    }')
+}
+
+IsDirectory(){
+    if [ "$LIST_VALUE" == "" ]
+        then
+            exit 1
+        fi
+    if [[ "$ListFlag" = true && "$MFlag" = false ]]
+    then
+        LexSort
+        LIST_VALUE=$(echo "$LIST_VALUE" | sed 's/^,*//g')
+        MAX_LENGTH=$(echo "$LIST_VALUE" | awk -F'/' '
+            {print $NF}' | awk -F";" 'BEGIN{max = 0}
+            {
+                if ( length($1) > max)
+                {max = length($1)}
+            }
+            END{print max}')
+        echo "$LIST_VALUE" | awk -F';' '
+            {
+                groups=$1;
+                if($1 == "" ){print $2 ": -"}
+                else {print $2 ": " substr(groups, 1, length(groups)-1)} 
+            }' | awk -F/ '{print $NF}' | awk -F: -v len="$MAX_LENGTH" ' 
+            {
+                TmpSpace=""
+                space=" "
+                tmp = len - length($1);
+                for(i = 0;i<tmp;i++)
+                TmpSpace = TmpSpace space;
+                printf("%s:%s%s\n", $1,TmpSpace, $2)
+            }'| sort 
+
+    elif [[ "$ListFlag" = true && "$MFlag" = true ]]
+    then
+        exit 1
+    elif [ "$MFlag" = true ]
+    then
+        w=false
+        while [ "$w" = false ]
+        do
+            TMP="$LIST_VALUE"
+            Count=$(echo "$LIST_VALUE" | awk -F';' '{
+            if(NF>max){
+                max=NF;
+                maxline=$0;
+            }
+            } 
+            END{
+            print maxline;
+            }')
+            LIST_VALUE="$Count" 
+            tmp=$(echo "$LIST_VALUE" | awk -F';' '
+            {
+            print $2
+            }')
+            if [ -f "$tmp" ]
+            then
+            w=true
+            else
+                LIST_VALUE="$TMP"
+                LIST_VALUE=$(echo "$LIST_VALUE" | grep -v "$Count")
+            fi
+        done
+        LIST_VALUE=$(echo "$LIST_VALUE" | awk -F';' '
+            {
+            print $2
+            }')
+        $OPEN "$LIST_VALUE"
+        exit 0
+    elif [ "$GFlag" = true ]
+    then
+        LIST_VALUE=$(echo "$LIST_VALUE" | sed '$d')
+        LIST_VALUE=$(echo "$LIST_VALUE" | awk -F';' '
+        {
+        print $2
+        }')
+        tag=$( tail -n 1 <<< "$LIST_VALUE" )
+        LIST_VALUE="$tag"
+        $OPEN "$LIST_VALUE"
+        exit 0
+    else
+        if [ "$LIST_VALUE" == "" ]
+        then
+            exit 1
+        fi
+        b=false
+        while [ "$b" = false ]
+        do  
+            TMP="$LIST_VALUE"
+            tag=$( tail -n 1 <<< "$LIST_VALUE" )
+            LIST_VALUE="$tag"
+            tmp=$(echo "$LIST_VALUE" | awk -F';' '
+            {
+            print $2
+            }')
+            if [ -f "$tmp" ]
+            then
+                b=true
+            else
+                LIST_VALUE="$TMP"
+                LIST_VALUE=$(echo "$LIST_VALUE" | grep -v "$tag")
+            fi
+        done
+        LIST_VALUE=$(echo "$LIST_VALUE" | awk -F';' '
+            {
+            print $2
+            }')
+        $OPEN "$LIST_VALUE"
+        exit 0
+    fi
+}
+
+max=0
+neniDir=false
+AfterFlag=false
+BeforeFlag=false
+GFlag=false
+MFlag=false
+FileFlag=false
+DirectoryFlag=false
+ListFlag=false
+SecretLogFlag=false
+flag=false
+
+if [ "$1" = "list" ]
+then
+    ListFlag=true
+    shift
+elif [ "$1" = "secret-log" ]
+then
+    SecretLogFlag=true
+    shift
+fi
+
+while [[ $# -gt 0 ]]; do
+    key="$1"
+    case $key in
+        -h)
+            helps
+            shift
+            ;;
+        -g)
+            if [ "$GFlag" = true ]
+            then 
+                echo "-g smí být použito pouze jednou"
+                exit 1
+            fi
+            GFlag=true
+            grupa="$2"
+            shift
+            shift
+            ;;
+        -b)
+            if [ "$BeforeFlag" = true ]
+            then 
+                echo "-b smí být použito pouze jednou"
+                exit 1
+            fi
+            BeforeFlag=true
+            DateB="$2"
+            Date="$2"
+            DateRegEx
+            shift
+            shift
+            ;;
+        -a)
+            if [ "$AfterFlag" = true ]
+            then 
+                echo "-a smí být použito pouze jednou"
+                exit 1
+            fi
+            AfterFlag=true
+            DateA="$2"
+            Date="$2"
+            DateRegEx
+            shift
+            shift
+            ;;
+        -m)
+            if [ "$MFlag" = true ]
+            then 
+                echo "-m smí být použito pouze jednou"
+                exit 1
+            fi
+            MFlag=true
+            shift
+            ;;
+        *)
+            FILE=$key
+            DIRECTORY=$key
+            flag=true
+            shift
+            ;;
+    esac
+done
+
+if [ "$flag" = true ]
+then
+    if [ -f "$FILE" ]
+    then
+        FileFlag=true
+        path=$(realpath $FILE)
+        if [ "$?" != "0" ]
+        then
+            echo "realpath not installed or file doesnt exist" >&2
+            exit 1 
+        fi
+
+        if [[ "$BeforeFlag" = true || "$AfterFlag" = true || "$MFlag" = true ]]
+        then 
+            exit 1
+        fi
+        $OPEN "$FILE"
+
+        if [ "$GFlag" = true ]
+        then
+            grep ";$path\;" "$MOLE_RC" > /dev/null
+            if [ "$?" -eq "0" ]
+            then
+                grep ";$path" "$MOLE_RC" > /dev/null
+                if [ "$?" -eq "0" ]
+                then 
+                    REPLACE_LINE=$(grep ";$path\;" "$MOLE_RC")
+                    grep  "$path" "$MOLE_RC" | grep -E "(^|[,])$grupa([,;]|$)" > /dev/null
+                    if [ "$?" -eq "0" ]
+                    then 
+                        REPLACE_LINE=$(grep ";$path\;" "$MOLE_RC")
+                        tmp=$(grep -v "$REPLACE_LINE" "$MOLE_RC")
+                        echo "$tmp" > "$MOLE_RC";
+                        echo "$REPLACE_LINE;$now" >> "$MOLE_RC"
+                    else
+                        tmp=$(grep -v "$REPLACE_LINE" "$MOLE_RC")
+                        echo "$tmp" > "$MOLE_RC";
+                        echo "$grupa,$REPLACE_LINE;$now" >> "$MOLE_RC"
+                    fi
+                else
+                    REPLACE_LINE=$(grep "$path\;" "$MOLE_RC")
+                    tmp=$(grep -v "$REPLACE_LINE" "$MOLE_RC")
+                    echo "$tmp" > "$MOLE_RC";
+                    echo "$grupa;$REPLACE_LINE;$now" >> "$MOLE_RC"
+                fi
+            else
+            echo "$grupa,;$path;$now" >> "$MOLE_RC"
+            fi
+        else 
+            grep "$path\;" "$MOLE_RC" > /dev/null
+            if [ "$?" -eq "0" ]
+            then    
+                REPLACE_LINE=$(grep ";$path\;" "$MOLE_RC")
+                tmp=$(grep -v "$REPLACE_LINE" "$MOLE_RC")
+                echo "$tmp" > "$MOLE_RC";
+                echo "$REPLACE_LINE;$now" >> "$MOLE_RC"
+            else 
+                echo ";$path;$now" >> "$MOLE_RC"
+            fi
+        fi
+    
+    elif [ -d "$DIRECTORY" ]
+    then
+        DirectoryFlag=true
+        CurrentDirectory=$DIRECTORY 
+        LIST_VALUE=$(grep -E "$CurrentDirectory/[^/ ]+;" "$MOLE_RC" | sed 's/;/;/g')
+        filters
+        if [ "$SecretLogFlag" = true ]
+        then 
+            Secret
+        fi
+        IsDirectory
+    fi
+    line=""
+    IFS=","
+    tmp=""
+    if [ "$SecretLogFlag" = true ]
+    then
+        for i in $DIRECTORY
+        do  
+            if [ -d "$i" ]
+            then
+                LIST_VALUE=$(grep -E "$i/[^/ ]+;" "$MOLE_RC" | sed 's/;/;/g')
+                tmp+="$LIST_VALUE"$'\n'
+                
+            fi
+        done
+        LIST_VALUE="$tmp"
+        filters
+        Secret
+    fi
+else
+    CurrentDirectory=$(pwd) 
+    if [ "$SecretLogFlag" = true ]
+    then
+        LIST_VALUE=$(cat "$MOLE_RC")
+        filters 
+        Secret
+    fi
+    LIST_VALUE=$(grep -E "$CurrentDirectory/[^/ ]+;" "$MOLE_RC" | sed 's/;/;/g')
+    filters
+    IsDirectory
+fi
